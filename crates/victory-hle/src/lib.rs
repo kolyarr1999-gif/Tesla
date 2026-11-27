@@ -162,3 +162,6 @@ mod tests {
         assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
     }
 }
+
+#[cfg(windows)]
+pub use victory_gpu::streamline;

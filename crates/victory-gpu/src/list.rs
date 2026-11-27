@@ -169,6 +169,18 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     }
 }
 
+/// Records a synchronous host upscaler dispatch in the title's current list.
+#[cfg(windows)]
+pub(crate) fn upscale(this: This, dispatch: impl FnOnce(&crate::host::HostList) -> bool) -> bool {
+    let mut recorded = false;
+    with_state(this, |host, state| {
+        recorded = dispatch(host);
+        // The SDK can change bindings even when its dispatch fails.
+        state.replay(host);
+    });
+    recorded
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

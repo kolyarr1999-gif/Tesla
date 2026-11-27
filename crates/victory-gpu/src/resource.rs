@@ -2398,7 +2398,7 @@ pub(crate) fn let_go_idle() {
     } else {
         PART
     };
-    let from = if part == PART { FROM.load(Relaxed) } else { 0 };
+    let from = if part == PART { idle_sweep_start(&all, FROM.load(Relaxed)) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
     // (coder K2) Lets `at`'s host copy go if it is idle and held by nothing else: its bytes.
@@ -4344,10 +4344,27 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+/// Restart the partial sweep if its saved cursor has no remaining texture.
+/// After feanorsun's VIctory-7900XTX#198.
+#[cfg(any(windows, test))]
+fn idle_sweep_start(textures: &std::collections::BTreeSet<usize>, cursor: usize) -> usize {
+    if textures.last().is_some_and(|&last| cursor <= last) { cursor } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn texture_retry_sweep_restarts_at_the_end_or_after_removal() {
+        let mut textures = std::collections::BTreeSet::from([1, 3, 5]);
+        assert_eq!(idle_sweep_start(&textures, 4), 4);
+        assert_eq!(idle_sweep_start(&textures, 6), 0);
+        textures.remove(&5);
+        assert_eq!(idle_sweep_start(&textures, 4), 0);
+        assert_eq!(idle_sweep_start(&std::collections::BTreeSet::new(), 4), 0);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

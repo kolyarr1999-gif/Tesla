@@ -991,6 +991,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        crate::streamline::device_made(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -4061,6 +4062,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod frame_generation;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -9922,6 +9924,8 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    frame_generation: Option<frame_generation::Generator>,
+    frame_generation_tried: bool,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -10416,6 +10420,12 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            if let Some(generator) = &p.frame_generation {
+                if let Err(error) = generator.finish() {
+                    tracing::warn!(%error, "frame-generation work did not finish before resizing");
+                    return None;
+                }
+            }
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -10427,6 +10437,8 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    p.frame_generation = None;
+                    p.frame_generation_tried = false;
                     tracing::info!(
                         width,
                         height,
@@ -10450,6 +10462,13 @@ impl Host {
                     drop(presenter);
                     return self.present_planes(texture, state_u32, None, frame);
                 }
+            }
+        }
+        if frame_generation::enabled() && frame_generation::supports(format) && !p.frame_generation_tried {
+            p.frame_generation_tried = true;
+            match frame_generation::Generator::new(self, width, height) {
+                Ok(generator) => p.frame_generation = Some(generator),
+                Err(error) => tracing::warn!(%error, "frame generation unavailable; showing real frames"),
             }
         }
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
@@ -10588,6 +10607,9 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            if let Some(generator) = &p.frame_generation {
+                generator.capture(copy, &back);
+            }
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
@@ -10636,7 +10658,10 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             // (Fox port A) `VICTORY_PRESENT_SKIP`: 0 as before, 1 never, N every Nth without waiting.
-            let _ = crate::shell::present_maybe(DXGI_PRESENT_DO_NOT_WAIT.0, |flags| p.swap_chain.Present(0, DXGI_PRESENT(flags)));
+            let presented = crate::shell::present_maybe(DXGI_PRESENT_DO_NOT_WAIT.0, |flags| p.swap_chain.Present(0, DXGI_PRESENT(flags)));
+            if let Some(generator) = &mut p.frame_generation {
+                generator.presented(frame, presented == Some(windows::Win32::Foundation::S_OK));
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -10696,6 +10721,8 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                frame_generation: None,
+                frame_generation_tried: false,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
@@ -12067,4 +12094,3 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
-

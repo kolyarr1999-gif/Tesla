@@ -92,6 +92,22 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Give workers the submitting thread waits for its above-normal priority.
+/// Based on trustno1-coder/VIctory-NVIDIA 80c70b7 (Indy2l, GPL-3.0-or-later).
+pub(crate) fn raise_submit_helper() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_HELPER_PRIORITY").is_some_and(|value| value == "1")) {
+        return;
+    }
+
+    // SAFETY: the worker only changes the priority of its own thread.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

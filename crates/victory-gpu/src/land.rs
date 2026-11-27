@@ -288,6 +288,7 @@ impl Pool {
     }
 
     fn help(&self) {
+        crate::cores::raise_submit_helper();
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {

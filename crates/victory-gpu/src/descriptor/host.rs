@@ -111,7 +111,12 @@ impl Made {
     }
 }
 
+// Ported from trustno1-coder/VIctory-NVIDIA 47747d6.
+static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// Distinguishes a replaced heap at the same title pointer.
+    pub(crate) id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -869,6 +874,9 @@ pub(crate) fn marked(at: usize, len: usize) {
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// A single pending rescan stands in for all ranges after an overflow.
+const FULL_REMAP_SCAN: (u64, u64) = (0, u64::MAX);
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -914,6 +922,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
+    if ranges.as_slice() == [FULL_REMAP_SCAN] {
+        return;
+    }
     // Pages are mapped one after the other.
     if let Some(last) = ranges.last_mut()
         && last.1 == start
@@ -922,8 +933,14 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // KLBF Lab: if no texture pass consumed the ranges, replace them
+        // with one rescan request so a remapped texture cannot be missed.
+        static RESCAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *RESCAN.get_or_init(|| std::env::var_os("VICTORY_REMAP_RESCAN").is_none_or(|value| value != "0")) {
+            ranges.clear();
+            ranges.push(FULL_REMAP_SCAN);
+            return;
+        }
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
         ranges.clear();
     }
@@ -1318,6 +1335,15 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    /// A new check supersedes the VRAM hold only for the same descriptor write.
+    /// After feanorsun's VIctory-7900XTX#199.
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
@@ -1328,7 +1354,7 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
@@ -1368,7 +1394,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1379,7 +1405,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
@@ -1923,6 +1949,7 @@ impl HostHeap {
             .flatten();
         let marks = std::sync::Arc::new(QueueMarks::new(if sampler { 0 } else { count as usize }));
         let h = HostHeap {
+            id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2260,11 +2287,21 @@ impl HostHeap {
         if ranges.is_empty() {
             return 0;
         }
-        join(&mut ranges);
+        let rescan = ranges.as_slice() == [FULL_REMAP_SCAN];
         let mut slots: Vec<u32> = {
+            if !rescan {
+                join(&mut ranges);
+            }
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            if rescan {
+                placed.by_slot.keys().copied().collect()
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
+        if rescan {
+            tracing::info!(slots = slots.len(), "texture mapping queue overflowed; rechecking placed texture slots");
+        }
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
@@ -3195,7 +3232,10 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -6040,6 +6080,36 @@ mod tests {
         assert_eq!(q.room(6), 0);
     }
 
+    #[test]
+    fn texture_retry_deadlines_survive_vram_recovery() {
+        let mut queue = TextureQueue::default();
+        for slot in 20..24 {
+            queue.written(slot, 1, 0, false);
+        }
+        let writes = queue.due(1, 10);
+        assert_eq!(writes.len(), 4);
+        for &(slot, write) in &writes {
+            queue.hold(slot, write, 4);
+        }
+        assert!(queue.due(3, 10).is_empty());
+        for (slot, write) in queue.due(4, 10) {
+            match slot {
+                20 => queue.later(slot, write, 5, 8),
+                21 => queue.partly(slot, write, 8, 4),
+                22 => queue.recheck(slot, write, 10, (16, 16), 1, 0, 4),
+                _ => {
+                    queue.hold(slot, write, 12);
+                    queue.later(slot, write + 1, 5, 8);
+                }
+            }
+        }
+        assert_eq!(queue.room(5), 1);
+        assert_eq!(queue.slots[&20].due, 6);
+        assert_eq!(queue.slots[&21].due, 8);
+        assert_eq!(queue.slots[&22].due, 10);
+        assert_eq!(queue.slots[&23].due, 5);
+    }
+
     /// Textures of which only the smallest levels are held, packed into
     /// one another's address range (the three of run 188: 0x2c000 bytes
     /// each at full size, their starts 0x2000 and 0x4000 apart): writing
@@ -6363,9 +6433,23 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id, a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return;
+        };
+        assert_ne!(a.id, b.id);
+        let first = a.dynamic(2).unwrap();
+        let allocated = a.free.load(std::sync::atomic::Ordering::Relaxed);
+        a.release(b.id, first, 2);
+        assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), allocated);
+        a.release(a.id, first, 2);
+        assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), allocated + 2);
     }
 
     #[test]
@@ -6381,17 +6465,17 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id, left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id, left, 2);
+        heap.release(heap.id, right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id, first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id, last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 

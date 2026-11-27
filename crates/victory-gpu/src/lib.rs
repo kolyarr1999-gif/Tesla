@@ -77,6 +77,10 @@ pub mod replay;
 #[cfg(windows)]
 mod residency;
 pub mod resource;
+#[cfg(windows)]
+mod external;
+#[cfg(windows)]
+pub mod streamline;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;

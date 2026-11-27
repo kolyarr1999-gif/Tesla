@@ -81,3 +81,6 @@ Thumbs.db
 game-folder.txt
 /runs/
 /run.log
+
+# Local rollback copies
+/.rollback-*/

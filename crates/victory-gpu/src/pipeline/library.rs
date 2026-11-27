@@ -651,16 +651,20 @@ static SAVING_NOW: AtomicBool = AtomicBool::new(false);
 /// pipelines made in the last 20 s before the watchdog ends a run were never
 /// written (run-49: 18 made at 355 s, last save 341 s, run ended at 360 s;
 /// the next run made them again, 3.7 s of waits in one frame).
-pub(crate) fn save_due() {
+fn save_interval_secs() -> u64 {
     static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let secs = *S.get_or_init(|| {
+    *S.get_or_init(|| {
         let s = std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0u64);
         tracing::info!(
             "host pipeline library: written {} (VICTORY_LIBRARY_SAVE_S={s})",
             if s == 0 { "by the workers at most every 20 s and at exit, as before" } else { "when pipelines wait to be written and the last save is that many seconds old" }
         );
         s
-    });
+    })
+}
+
+pub(crate) fn save_due() {
+    let secs = save_interval_secs();
     let pending = library().map_or(0, |l| l.added.load(Ordering::Relaxed));
     if secs == 0 || pending == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
         return;
@@ -683,6 +687,10 @@ pub(crate) fn save_due() {
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    // On the scheduled path, only the sweep and a clean exit force a write.
+    if !now && save_interval_secs() != 0 {
+        return;
+    }
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {

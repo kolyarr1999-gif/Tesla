@@ -1,31 +1,51 @@
 param(
     [Parameter(Mandatory)][string]$Game,
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
+    [switch]$FullHD,
     [ValidateRange(0, 3)][int]$MipDrop = 1,
     [int]$CardBuffersMB = 1024,
     [int]$CardWindowsMB = 512,
+    [ValidateRange(0, 4096)][int]$SendSpareMB = 768,
+    [ValidateRange(1, 128)][int]$JoinLists = 48,
+    [ValidateSet('Quality', 'Off')][string]$Dlss = 'Off',
     [switch]$Hooks,
     [switch]$ProbeRays,
     [switch]$RayTracing,
+    [switch]$FrameGeneration,
+    [switch]$OriginalWaterLight,
+    [switch]$OriginalScheduler,
+    [switch]$OriginalSceneLoading,
+    [switch]$PrepareCutscenes,
+    [switch]$WarmOnly,
     [switch]$Prewarm
 )
 $ErrorActionPreference = 'Stop'
+if ($FullHD) { $Console = 'series-s' }
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root 'target\release\victory.exe'
 if (-not (Test-Path -LiteralPath $exe)) {
     $exe = Join-Path $root 'victory.exe'
 }
+$sceneExe = Join-Path $root 'target\release\victory-scene.exe'
+if (!$OriginalSceneLoading -and (Test-Path -LiteralPath $sceneExe -PathType Leaf)) {
+    $exe = $sceneExe
+}
+$dlssExe = Join-Path $root 'target\release\victory-dlss.exe'
+if ($Dlss -eq 'Quality' -and $Console -eq 'series-s' -and (Test-Path -LiteralPath $dlssExe -PathType Leaf)) {
+    $exe = $dlssExe
+}
 if (-not (Test-Path -LiteralPath $exe)) {
-    throw "Release binary not found next to script or in target\release\victory.exe"
+    throw "Release binary not found: $exe"
 }
 if (-not (Test-Path -LiteralPath $Game)) {
     throw "Game not found: $Game"
 }
-if (Get-Process victory -ErrorAction SilentlyContinue) {
+if (Get-Process victory,victory-dlss,victory-scene -ErrorAction SilentlyContinue) {
     Write-Host "victory.exe is already running." -ForegroundColor Yellow
     exit 1
 }
 
+$streamlineDir = $env:VICTORY_STREAMLINE_DIR
 # Clear inherited VICTORY_* except path overrides (keeps default save & cache)
 $keep = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $keep } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
@@ -42,6 +62,7 @@ $set = [ordered]@{
     VICTORY_MAX_PRELUDES         = '32'
     VICTORY_CARD_BUFFERS_MB      = "$CardBuffersMB"
     VICTORY_CARD_WINDOWS_MB      = "$CardWindowsMB"
+    VICTORY_SEND_SPARE_MB        = "$SendSpareMB"
     VICTORY_TEXTURE_MIP_DROP     = "$MipDrop"
     VICTORY_TEXTURE_ROOM_PERCENT = '94'
     VICTORY_PAGE_POOL            = '1'
@@ -76,6 +97,7 @@ $set = [ordered]@{
     VICTORY_CARD_AWAKE           = '0'
     VICTORY_SHOW_AFTER           = '1'
     VICTORY_JOIN_PARTS           = '8'
+    VICTORY_JOIN_LISTS           = "$JoinLists"
     VICTORY_UPLOAD_AHEAD         = '1'
     VICTORY_CARD_BUFFERS_MIN_KB  = '64'
     VICTORY_POOL_DISCARD         = '1'
@@ -106,6 +128,26 @@ $set = [ordered]@{
     VICTORY_PORT_CONSTANTS       = '1'
     VICTORY_EARLY_DEPTH          = '1'
 }
+# Work around dark water tiles on NVIDIA, after scarlet-fps and VIctory-NVIDIA 35c1560.
+# The unmodified two tiled light passes can be restored for visual comparison.
+if (!$OriginalWaterLight) {
+    $set.VICTORY_LEAVE_OUT += ',5dc3b25986622949,6f225b641c5b0708'
+    Write-Host 'Water: dark-tile workaround enabled'
+}
+if ($Dlss -eq 'Quality') {
+    if ($Console -eq 'series-s') {
+        if (!$streamlineDir -or !(Test-Path -LiteralPath (Join-Path $streamlineDir 'sl.interposer.dll') -PathType Leaf)) {
+            throw 'Point VICTORY_STREAMLINE_DIR at the bin\x64 folder of NVIDIA Streamline SDK.'
+        }
+        $set.VICTORY_DLSS = '1'
+        $set.VICTORY_STREAMLINE_DIR = $streamlineDir
+        Write-Host 'Upscaling requested: DLSS Quality'
+    } else {
+        Write-Host 'DLSS Quality is available on the Series S profile. Using the title upscaler.' -ForegroundColor Yellow
+    }
+}
+
+if ($FrameGeneration) { Write-Warning 'Frame generation is disabled for native FPS testing.' }
 if ($Hooks) {
     $set.VICTORY_GPU_ONLY = '1'
     $set.VICTORY_KNOWN_WRITES = '1'
@@ -119,12 +161,29 @@ if ($ProbeRays -and -not $RayTracing) {
 }
 if ($RayTracing) { $set.VICTORY_BVH_BUILDER = '1' }
 
+# Keep the submitter's helpers ahead of background work and save the
+# pipeline library on its own thread at most once every three minutes.
+if (!$OriginalScheduler) {
+    $set.VICTORY_HELPER_PRIORITY = '1'
+    $set.VICTORY_LIBRARY_SAVE_S = '180'
+}
+
+if ($OriginalSceneLoading) { $set.VICTORY_REMAP_RESCAN = '0' }
+
 foreach ($k in $set.Keys) { Set-Item -Path "Env:$k" -Value $set[$k] }
 
 if ($Prewarm) {
-    Write-Host "Prewarming shaders and pipelines..." -ForegroundColor Cyan
+    Write-Host 'Prewarming shaders and pipelines...' -ForegroundColor Cyan
     & $exe shaders $gameDir
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+if ($WarmOnly -or $PrepareCutscenes) {
+    Write-Host 'Warming pipelines requested in previous runs...' -ForegroundColor Cyan
+    & $exe warm --used
+    if ($WarmOnly -or $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} elseif ($Prewarm) {
     & $exe warm
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 $runsDir = Join-Path $root 'runs'
@@ -132,7 +191,11 @@ New-Item -ItemType Directory -Force -Path $runsDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logPath = Join-Path $runsDir "3070-$stamp.log"
 
-Write-Host "=== victory-scarlett RTX 3070 8GB (release, $Console, MipDrop=$MipDrop, PagePool=1) ===" -ForegroundColor Green
+Write-Host "=== victory-scarlett RTX 3070 8GB (release, $Console, MipDrop=$MipDrop, PagePool=1, SendSpareMB=$SendSpareMB, JoinLists=$JoinLists) ===" -ForegroundColor Green
+if ($Console -eq 'series-s') {
+    $upscaler = if ($Dlss -eq 'Quality') { 'DLSS Quality requested' } else { 'title upscaling' }
+    Write-Host "Series S output: 1920x1080 ($upscaler)"
+}
 Write-Host "Log: $logPath"
 $ErrorActionPreference = 'Continue'
 & $exe run $Game --execute --console $Console 2>&1 | Tee-Object -FilePath $logPath

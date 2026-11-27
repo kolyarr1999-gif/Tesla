@@ -1546,6 +1546,7 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                crate::cores::raise_submit_helper();
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -5377,13 +5378,16 @@ impl Shadow {
         if ranges.is_empty() {
             return 0;
         }
-        // fxceless#1350: reuse scratch buffer; skip fully superseded reads.
-        if title.len() < n {
-            title.resize(n, 0);
+        // Reuse both the merge buffer and its snapshot across this worker's
+        // pieces. The snapshot is only needed if there is a CPU mapping.
+        if title.len() < 2 * n {
+            title.resize(2 * n, 0);
         }
-        let title = &mut title[..n];
+        let (title, was) = title[..2 * n].split_at_mut(n);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let was = title.to_vec();
+        if mapped {
+            was.copy_from_slice(title);
+        }
         let mut changed = false;
         for &(a, b) in ranges {
             let (a, b) = (a - at, b - at);
@@ -5394,7 +5398,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        put_changed(start + at, &was, title)
+        put_changed(start + at, was, title)
     }
 }
 
@@ -5500,14 +5504,25 @@ impl Shadow {
                 continue;
             }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            let whole = [(0, hi - lo)];
+            let mut partial;
+            let parts = if near.is_empty() {
+                &whole[..]
+            } else {
+                partial = outside(lo, hi, near);
+                for (start, end) in &mut partial {
+                    *start -= lo;
+                    *end -= lo;
+                }
+                &partial
+            };
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);

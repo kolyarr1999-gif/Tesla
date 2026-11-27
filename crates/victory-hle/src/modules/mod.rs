@@ -14,6 +14,8 @@ pub mod affinity;
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
+#[cfg(windows)]
+pub mod fidelityfx;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
